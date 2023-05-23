@@ -1,0 +1,118 @@
+########################################################################################################################
+#                                                    SCRIPT INTOXICACAO - VIOLENCIA                                                     #
+########################################################################################################################
+#==========================================================#
+#           CABECALHO PADRAO DE TODOS OS SCRIPTS           #
+#==========================================================#
+cat("\014")
+rm(list=ls())
+gc()
+
+start_time <- Sys.time()
+pkgArr <- c("foreign", "tidyverse", "abjutils", "openxlsx", "readxl", "stringr", "lubridate", "writexl", "tcltk")
+current_working_dir <- dirname(rstudioapi::getActiveDocumentContext()$path)
+
+rFiles <- list.files(pattern = ".R")
+
+setwd("D:/Cruzamento banco de dados")
+library(foreign)
+library(tcltk)
+library(writexl)
+library(lubridate)
+library(stringr)
+library(readxl)
+library(openxlsx)
+library(abjutils)
+library(tidyverse)
+
+library(stringr)
+source(rFiles[str_detect(rFiles, regex("^fun.*geral", T))])
+source(rFiles[str_detect(rFiles, regex("^fun.*obito", T))])
+Install_N_Load_Packages(pkgArr)
+
+
+#==========================================================#
+#                    LER BASES DO SINAN                    #
+#==========================================================#
+# Base de Intoxicacao Exogena (BIE)
+SINAN_BIE <- data.frame(read.dbf("Banco de Intoxicação Exógena 16022022.dbf", as.is = T))
+
+# Base de Violencia Interpessoal/Autoprovocada (BVIA)
+SINAN_BVIA <- data.frame(read.dbf("Banco de Violência 16022022.dbf", as.is = T))
+
+
+#==========================================================#
+#           SELECIONAR AS VARIAVEIS NECESSARIAS            #
+#==========================================================#
+SINAN_BIE <- SINAN_BIE %>%
+  select("DT_INVEST", "DT_SIN_PRI", "DT_NASC", "NM_PACIENT", "NM_MAE_PAC", "ID_MN_RESI") %>%
+  mutate(DT_INVEST = as.Date(DT_INVEST, format = "%d/%m/%Y"),
+         DT_SIN_PRI = as.Date(DT_SIN_PRI, "%d/%m/%Y"),
+         DT_NASC = as.Date(DT_NASC, "%d/%m/%Y"),
+         NOTIFICADO_NA_BVIA = "NAO")
+
+
+SINAN_BVIA <- SINAN_BVIA %>%
+  select("DT_NOTIFIC", "DT_OCOR", "DT_NASC", "NM_PACIENT", "NM_MAE_PAC", "ID_MN_RESI", 
+         "LES_AUTOP", "AG_ENVEN") %>%
+  mutate(DT_NOTIFIC = as.Date(DT_NOTIFIC, format = "%d/%m/%Y"),
+         DT_OCOR = as.Date(DT_OCOR, "%d/%m/%Y"),
+         DT_NASC = as.Date(DT_NASC, "%d/%m/%Y"))
+
+
+#==========================================================#
+#    FILTRAR APENAS LESAO AUTOPROVOCADA POR INTOXICACAO    #
+#==========================================================#
+SINAN_BVIA <- subset(SINAN_BVIA, 
+                     SINAN_BVIA$LES_AUTOP == "1" & SINAN_BVIA$AG_ENVEN == "1")
+
+
+#==========================================================#
+#               CRIAR CHAVE DE IDENTIFICACAO               #
+#==========================================================#
+# Cria lista com as duas bases
+SINAN <- list(SINAN_BIE = SINAN_BIE, 
+              SINAN_BVIA = SINAN_BVIA)
+
+# Cria coluna com nomes de filho e mae mesclados
+SINAN <- SINAN %>%
+  map(~ .x %>% mutate(NM_MAE_PAC = ifelse((is.na(NM_MAE_PAC)), "", NM_MAE_PAC))) %>%
+  map(~ .x %>% mutate(INICIAIS_NOMES = paste(NM_PACIENT, NM_MAE_PAC))) %>%
+  map(~ .x %>% mutate(INICIAIS_NOMES = str_replace_all(INICIAIS_NOMES, 
+                                                       regex("\\bd[oea]?s?\\b", T), ""))) %>%
+  map(~ .x %>% mutate(INICIAIS_NOMES = gsub("(?<=[\\w])[^\\W]+", "", INICIAIS_NOMES, perl = T))) %>%
+  map(~ .x %>% mutate(INICIAIS_NOMES = str_replace_all(INICIAIS_NOMES, regex("[\\s\\.]+"), ""))) %>%
+  map(~ .x %>% mutate(INICIAIS_NOMES = str_replace_all(INICIAIS_NOMES, regex("\\W\\w\\W"), "")))  %>%
+  map(~ .x %>% mutate(CHAVAO = paste0(INICIAIS_NOMES, '_', DT_NASC)))
+
+# Retira objetos da lista
+SINAN_BIE <- SINAN[["SINAN_BIE"]]
+SINAN_BVIA <- SINAN[["SINAN_BVIA"]]
+rm(SINAN)
+gc()
+
+#==========================================================#
+#             CRIAR COLUNA DE RECORRENCIA NA BIE           #
+#==========================================================#
+SINAN_BIE$RECORRENCIA <- table(SINAN_BIE$CHAVAO)[SINAN_BIE$CHAVAO]
+SINAN_BVIA$RECORRENCIA <- table(SINAN_BVIA$CHAVAO)[SINAN_BVIA$CHAVAO]
+
+SINAN_BIE$CHAVAO_RECORRENCIA <- paste0(SINAN_BIE$CHAVAO, '_', SINAN_BIE$RECORRENCIA)
+SINAN_BVIA$CHAVAO_RECORRENCIA <- paste0(SINAN_BVIA$CHAVAO, '_', SINAN_BVIA$RECORRENCIA)
+
+# table(SINAN_BIE$RECORRENCIA)
+
+#==========================================================#
+#             IDENTIFICAR NOTIFICACOES NA BVIA             #
+#==========================================================#
+# Premissa: estamos assumindo que não há duplicidades entre "CHAVÕES": repetições são consideradas recorrências
+SINAN_BIE$NOTIFICADO_NA_BVIA[SINAN_BIE$CHAVAO_RECORRENCIA %in% SINAN_BVIA$CHAVAO_RECORRENCIA] <- 'SIM'
+
+# Premissa: o registro no SINAN_BIE pode ocorrer antes ou depois do registro na SINAN_BVIA
+# Premissa: as datas de ocorrências declaradas e registradas tem uma precisão cujo erro é de, no máximo, 3 dias
+# SINAN_BIE$NOTIFICADO_NA_BVIA[SINAN_BIE$CHAVAO %in% SINAN_BVIA$CHAVAO & abs(as.numeric(SINAN_BIE$DT_SIN_PRI - SINAN_BVIA$DT_OCOR)) <= 3] <- 'SIM'
+
+# SINAN_BIE$NOTIFICADO_NA_BVIA <- ifelse((SINAN_BIE$CHAVAO %in% SINAN_BVIA$CHAVAO &
+#                                          SINAN_BIE$DT_SIN_PRI %in% SINAN_BVIA$DT_OCOR), "SIM", "NAO")
+
+write.xlsx(SINAN_BIE, "SINAN_BIE.xlsx")
